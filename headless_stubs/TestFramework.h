@@ -242,6 +242,10 @@ struct ResumeOtherThreads {
 // ---------------------------------------------------------------------------
 
 #include "reversiblehooks/ReversibleHooks.h"
+#include "reversiblehooks/HookCategory.h"      // HookCategory::Item, FindItem
+#include "reversiblehooks/RootHookCategory.h"  // GetRootCategory() returns this; needs the full type
+#include "reversiblehooks/ReversibleHook/Base.h" // Hooked(), Locked(), State()
+#include "toolsmenu/Utility.h"                 // SplitStringView
 
 // Toggle a single hook on/off by its full path (e.g., "Global/CGeneral/LimitAngle").
 // Returns true if the toggle succeeded.
@@ -250,40 +254,128 @@ inline bool SetHookEnabled(const char* path, bool enabled) {
     return r == ReversibleHooks::SetCatOrItemStateResult::Done;
 }
 
-// RAII guard: ensures hook is disabled for original code, restores previous state on destruction.
-// Handles the case where --unhook-except already disabled the hook — the guard will
-// enable it first (so reversed code is active), then disable (original), then restore.
+// Resolve a hook path to the item itself.
+//
+// SetCategoryOrItemStateByPath collapses several distinct outcomes into the
+// single result `Locked`, which made a real failure unreadable: run on
+// 2026-08-12 reported "hook 'Global/CPostEffects/SpeedFX' is locked" when the
+// install line carries no `.locked` at all. Going through the item directly
+// lets the guard state what is actually true -- locked, missing, or already in
+// the wanted state -- instead of guessing.
+inline ReversibleHooks::HookCategory::Item FindItemByPath(const char* path) {
+    std::string_view p{path};
+    if (p.ends_with("/")) {
+        p.remove_suffix(1);
+    }
+    const auto parts = SplitStringView(p, "/") | rng::to<std::vector>();
+    if (parts.empty()) {
+        return nullptr;
+    }
+    ReversibleHooks::HookCategory* cat = &ReversibleHooks::GetRootCategory();
+    for (auto name : std::span(parts).first(parts.size() - 1)) {
+        cat = cat->FindSubcategory(name);
+        if (!cat) {
+            return nullptr;
+        }
+    }
+    return cat->FindItem(parts.back());
+}
+
+// RAII guard: runs the ORIGINAL code for the duration of its scope, then puts
+// the hook back exactly as it found it.
+//
+// Why it does not just call SetCategoryOrItemStateByPath: the test harness
+// launches under `--unhook-except=Global/CLoadingScreen`, which dllmain.cpp
+// implements as SetAllItemsEnabled(false) -- every hook off. A differential
+// test therefore starts with its own hook DISABLED, and must enable it to have
+// any reversed code to compare against. Enabling a whole category instead is
+// not an option: the sibling hooks are disabled precisely because they crash
+// during init under Wine (see run-headless.sh).
+//
+// So: toggle exactly one item, restore exactly that item.
 struct HookDisableGuard {
     const char* path;
     bool needsRestore; // true if we need to re-enable on destruction
     bool valid;        // true if the hook path was found
 
-    explicit HookDisableGuard(const char* hookPath) : path(hookPath), needsRestore(false), valid(false) {
-        // First ensure the hook is enabled (reversed code active)
-        auto enableResult = ReversibleHooks::SetCategoryOrItemStateByPath(path, true);
-        if (enableResult == ReversibleHooks::SetCatOrItemStateResult::NotFound) {
+    bool wasHooked;    // state on entry, so we restore rather than assume
+
+    explicit HookDisableGuard(const char* hookPath)
+        : path(hookPath), needsRestore(false), valid(false), wasHooked(false)
+    {
+        auto item = FindItemByPath(path);
+        if (!item) {
             char msg[256];
             _snprintf(msg, sizeof(msg), "HookDisableGuard: hook '%s' not found", path);
             GetTestContext().RecordFailure(__FILE__, __LINE__, msg);
             return;
         }
-        if (enableResult == ReversibleHooks::SetCatOrItemStateResult::Locked) {
+        if (item->Locked()) {
+            // Report what is actually true rather than naming a cause. The
+            // install line for SpeedFX carries no `.locked`, so if this fires
+            // the lock is coming from somewhere else and the flags say where.
+            // name= confirms WHICH item resolved: FindItem matches on name
+            // alone, so a collision would silently return the wrong hook.
             char msg[256];
-            _snprintf(msg, sizeof(msg), "HookDisableGuard: hook '%s' is locked", path);
+            _snprintf(msg, sizeof(msg),
+                      "HookDisableGuard: '%s' -> name='%s' sym=%s locked=%d hooked=%d",
+                      path, item->Name().c_str(), item->Symbol(),
+                      (int)item->Locked(), (int)item->Hooked());
             GetTestContext().RecordFailure(__FILE__, __LINE__, msg);
             return;
         }
+
+        wasHooked = item->Hooked();
+
+        // The reversed code must be installed, or there is nothing to compare
+        // against -- both sides of the diff would run the original and agree
+        // vacuously. Enable it if --unhook-except turned it off.
+        if (!item->Hooked()) {
+            item->State(true);
+            if (!item->Hooked()) {
+                char msg[256];
+                _snprintf(msg, sizeof(msg),
+                          "HookDisableGuard: hook '%s' would not enable (Switch() did not take)", path);
+                GetTestContext().RecordFailure(__FILE__, __LINE__, msg);
+                return;
+            }
+        }
         valid = true;
 
-        // Now disable (switches to original code)
-        ReversibleHooks::SetCategoryOrItemStateByPath(path, false);
+        // Now switch to the ORIGINAL for the body of the scope.
+        item->State(false);
+
+        // VERIFY IT TOOK. Enabling is checked above; this switch was not, and
+        // an unverified unhook is how a differential test compares the reversed
+        // code against ITSELF and passes. Measured 2026-08-13: an off-by-one in
+        // CStreamingInfo::SetCdPosnAndSize was compiled into the ASI and
+        // Diff_SetAndGetCdPosnAndSize passed anyway, with 8 assertions and two
+        // independent checks that should each have caught it.
+        //
+        // valid stays false on failure, so callers that honour it skip rather
+        // than record a meaningless comparison.
+        if (item->Hooked()) {
+            char msg[256];
+            _snprintf(msg, sizeof(msg),
+                      "HookDisableGuard: '%s' unhook did not take -- still hooked "
+                      "(locked=%d wasHooked=%d). The 'original' call would run "
+                      "REVERSED code and the comparison would be vacuous.",
+                      path, (int)item->Locked(), (int)wasHooked);
+            GetTestContext().RecordFailure(__FILE__, __LINE__, msg);
+            valid = false;
+            // Still restore: we changed state, so the destructor must undo it.
+            needsRestore = true;
+            return;
+        }
+
         needsRestore = true;
     }
 
     ~HookDisableGuard() {
         if (needsRestore) {
-            // Re-enable (back to reversed code)
-            ReversibleHooks::SetCategoryOrItemStateByPath(path, true);
+            if (auto item = FindItemByPath(path)) {
+                item->State(wasHooked);   // restore what we found, not what we assume
+            }
         }
     }
 
