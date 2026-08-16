@@ -210,6 +210,14 @@ void GameTestRunnerOnFrame() {
                 failed++;
                 TestLog("  FAIL  %s/%s: %s", test.className, test.testName, ctx.firstFailure);
             }
+
+            // Coverage/census diagnostics, on their own line so the PASS/FAIL
+            // line keeps its existing shape for anything already parsing it.
+            // Emitted for passing tests too -- that is the point: a green needs
+            // to be able to say what it actually exercised.
+            if (ctx.info[0] != '\0') {
+                TestLog("  INFO  %s/%s: %s", test.className, test.testName, ctx.info);
+            }
         }
         if (skipped > 0) {
             TestLog("SKIPPED=%d (filter: %s)", skipped, filter);

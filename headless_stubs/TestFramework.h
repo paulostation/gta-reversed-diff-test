@@ -61,12 +61,42 @@ struct GameTestContext {
     int failures;
     char firstFailure[512];
 
+    // Non-failing diagnostic channel. printf does NOT reach
+    // game_test_results.txt, so before this existed the only way to report a
+    // coverage counter was to fake a failure with RecordFailure and delete the
+    // scaffold afterwards (the bike run and the ChoosePoliceCarModel run both
+    // did exactly that). A test that cannot say what it covered cannot be shown
+    // to be non-vacuous, which is the whole point of ADR 0002 -- so the channel
+    // is permanent rather than per-test scaffolding.
+    //
+    // Appended to, not overwritten: a test may report several facts, and the
+    // one that gets truncated should be the last, not the first.
+    char info[1024];
+    int  infoLen;
+
     void Reset(const char* cls, const char* name) {
         className = cls;
         testName = name;
         assertions = 0;
         failures = 0;
         firstFailure[0] = '\0';
+        info[0] = '\0';
+        infoLen = 0;
+    }
+
+    // Record a diagnostic that reaches the results file WITHOUT failing the
+    // test. Use for coverage counters and census data -- the evidence that a
+    // green means something.
+    void RecordInfo(const char* msg) {
+        if (infoLen < 0 || infoLen >= (int)sizeof(info) - 1) {
+            return;   // full; drop rather than truncate mid-token
+        }
+        const int n = _snprintf(info + infoLen, sizeof(info) - infoLen - 1,
+                                "%s%s", infoLen ? " | " : "", msg);
+        if (n > 0) {
+            infoLen += n;
+        }
+        info[sizeof(info) - 1] = '\0';
     }
 
     void RecordFailure(const char* file, int line, const char* msg) {
@@ -87,6 +117,16 @@ inline GameTestContext& GetTestContext() {
 // ---------------------------------------------------------------------------
 // Assertion macros
 // ---------------------------------------------------------------------------
+
+// Report a diagnostic that reaches game_test_results.txt without failing the
+// test. Printf-style, so counters can be formatted inline:
+//   RECORD_INFO("compared=%d bikes=%d", compared, bikes);
+#define RECORD_INFO(...) do { \
+    char _info[512]; \
+    _snprintf(_info, sizeof(_info), __VA_ARGS__); \
+    _info[sizeof(_info) - 1] = '\0'; \
+    GetTestContext().RecordInfo(_info); \
+} while(0)
 
 #define EXPECT_TRUE(expr) do { \
     GetTestContext().assertions++; \
